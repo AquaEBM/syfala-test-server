@@ -73,61 +73,63 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut port_buf_ptrs =
         Box::from_iter(iter::repeat_with(JackBufPtrMut::dangling).take(num_ports.get()));
 
-    // client.connect_ports_by_name("SERVER:output", "system:playback_4").unwrap();
-    // client.connect_ports_by_name("SERVER:output", "system:playback_3").unwrap();
-
     let (mut tx, mut rx) = rtrb::RingBuffer::new(rb_size_samples.get());
 
-    let reader_async_client = jack::contrib::ClosureProcessHandler::with_state(
-        (),
-        move |_, _client, scope| {
-            let mut remaining_frames = scope.n_frames() as usize;
+    let reader_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
+        let mut remaining_frames = scope.n_frames() as usize;
 
-            for (port, ptr) in ports.iter_mut().zip(&mut port_buf_ptrs) {
-                *ptr = JackBufPtrMut::from_slice(port.as_mut_slice(scope))
-            }
+        for (port, ptr) in ports.iter_mut().zip(&mut port_buf_ptrs) {
+            *ptr = JackBufPtrMut::from_slice(port.as_mut_slice(scope))
+        }
 
-            while let Some(rem) = NonZeroUsize::new(remaining_frames) {
-                let frames = CHUNK_SIZE_FRAMES.min(rem);
+        while let Some(rem) = NonZeroUsize::new(remaining_frames) {
+            let frames = CHUNK_SIZE_FRAMES.min(rem);
+            remaining_frames -= frames.get();
 
-                let Ok(read_chunk) = rx.read_chunk(num_ports.checked_mul(frames).unwrap().get())
-                else {
-                    continue;
-                };
+            let Ok(read_chunk) = rx.read_chunk(num_ports.checked_mul(frames).unwrap().get()) else {
+                continue;
+            };
 
-                let (start, end) = read_chunk.as_slices();
+            let (start, end) = read_chunk.as_slices();
 
-                let mut rb_chunk_iter = start.iter().chain(end.iter());
+            let mut rb_chunk_iter = start.iter().chain(end.iter());
 
-                for _i in 0..frames.get() {
-                    // deinterleave chunk contents
+            for _i in 0..frames.get() {
+                // deinterleave chunk contents
 
-                    for buf in &mut port_buf_ptrs {
-                        let &sample = rb_chunk_iter.next().unwrap();
+                for buf in &mut port_buf_ptrs {
+                    let &sample = rb_chunk_iter.next().unwrap();
 
-                        // SAFETY: buf is valid, and within the actual buffer's bounds
-                        unsafe { buf.write(sample) };
+                    // SAFETY: buf is valid, and within the actual buffer's bounds
+                    unsafe { buf.write(sample) };
 
-                        // SAFETY: this happens at most `frames` times, guaranteeing this stays within the buffer
-                        *buf = unsafe { buf.increment() };
-                    }
-                }
-
-                read_chunk.commit_all();
-
-                remaining_frames -= frames.get();
-
-                if rb_size_samples.get() - rx.slots() >= net_chunk_size_spls.get() {
-                    network_thread.unpark();
+                    // SAFETY: this happens at most `frames` times, guaranteeing this stays within the buffer
+                    *buf = unsafe { buf.increment() };
                 }
             }
 
-            jack::Control::Continue
-        },
-        |_, _, _| jack::Control::Continue,
-    );
+            read_chunk.commit_all();
 
-    let _active_client = client.activate_async((), reader_async_client);
+            if rb_size_samples.get() - rx.slots() >= net_chunk_size_spls.get() {
+                network_thread.unpark();
+            }
+        }
+
+        jack::Control::Continue
+    });
+
+    let active_client = client.activate_async((), reader_async_client).unwrap();
+
+    let client = active_client.as_client();
+
+    for i in 0..num_ports.get() {
+        client
+            .connect_ports_by_name(
+                &format!("SERVER:output{i}"),
+                &format!("system:playback_{}", i % 2 + 1),
+            )
+            .unwrap()
+    }
 
     loop {
         let Ok(mut write_chunk) = tx.write_chunk_uninit(net_chunk_size_spls.get()) else {
