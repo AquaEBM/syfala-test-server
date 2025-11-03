@@ -1,5 +1,11 @@
-use core::{error::Error, iter, mem, num, ptr, sync::atomic::{AtomicUsize, Ordering}};
-use std::{collections::HashMap, io::{self, Read, Write}};
+use core::{
+    cell::RefCell, cmp, error::Error, iter, num, ptr
+};
+use std::{collections::{HashMap, VecDeque}, io, rc::Rc};
+
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+};
 
 fn as_bytes_mut(data: &mut [f32]) -> &mut [u8] {
     // SAFETY: all bit patterns for f32 (and u8) are valid, references have same lifetime
@@ -15,11 +21,23 @@ const RB_MIN_NUM_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 10).unw
 const CHUNK_SIZE_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 4).unwrap();
 const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN;
 
-fn read_exact_array<const N: usize>(
-    reader: &mut (impl Read + Unpin + ?Sized),
+async fn read_exact_array<const N: usize>(
+    reader: &mut (impl AsyncRead + Unpin + ?Sized),
 ) -> io::Result<[u8; N]> {
     let mut buf = [0; N];
-    reader.read_exact(&mut buf).map(|_| buf)
+    reader.read_exact(&mut buf).await.map(|_| buf)
+}
+
+enum TCPEvent {
+    NewClient {
+        addr: core::net::SocketAddr,
+        rx: ClientRx,
+        tx: ClientTx,
+    },
+
+    RemoveClient {
+        addr: core::net::SocketAddr,
+    },
 }
 
 struct ClientRx {
@@ -28,20 +46,9 @@ struct ClientRx {
 }
 
 struct ClientTx {
-    tx: rtrb::Consumer<f32>,
+    tx: rtrb::Producer<f32>,
     n_ports: num::NonZeroUsize,
-    scratch_buffer: Box<[mem::MaybeUninit<f32>]>,
-    
-}
-
-fn fetch_sub_saturating(a: &AtomicUsize, b: usize) -> usize {
-    let mut old = a.load(Ordering::Relaxed);
-
-    while let Err(v) = a.compare_exchange_weak(old, old.saturating_sub(b), Ordering::Relaxed, Ordering::Relaxed) {
-        old = v;
-    }
-
-    old
+    scratch_buffer: VecDeque<f32>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,6 +81,66 @@ impl JackBufPtrMut {
 unsafe impl Send for JackBufPtrMut {}
 unsafe impl Sync for JackBufPtrMut {}
 
+async fn handle_tcp_connection(
+    mut stream: tokio::net::TcpStream,
+    addr: core::net::SocketAddr,
+    num_available_ports: usize,
+    rb_size_frames: num::NonZeroUsize,
+    tx_sender: Rc<RefCell<rtrb::Producer<TCPEvent>>>,
+) -> Result<usize, io::Error> {
+    // read the requested port count
+    let requested_num_ports = read_exact_array(&mut stream)
+        .await
+        .map(usize::from_be_bytes)?;
+
+    println!("Client at {addr} requested {requested_num_ports} ports...");
+
+    let n_ports = cmp::min(num_available_ports, requested_num_ports);
+
+    // Return how many we can actually serve
+    stream.write_all(&n_ports.to_be_bytes()).await?;
+
+    println!("Client at {addr} got {n_ports} ports");
+
+    // Also, return the buffering suggestion
+    stream
+        .write_all(&CHUNK_SIZE_FRAMES.get().to_be_bytes())
+        .await?;
+
+    let Some(n_ports) = num::NonZeroUsize::new(n_ports) else {
+        return Ok(0);
+    };
+
+    let rb_size_spls = rb_size_frames.checked_mul(n_ports).unwrap();
+
+    let (tx, rx) = rtrb::RingBuffer::new(rb_size_spls.get());
+
+    tx_sender.borrow_mut().push(TCPEvent::NewClient {
+        addr,
+        tx: ClientTx { tx, n_ports, scratch_buffer: VecDeque::new() },
+        rx: ClientRx { rx, n_ports },
+    })
+        .expect("ERROR: Clients with duplicate addresses found");
+
+    println!("Waiting for client at {addr} to disconnect...");
+
+    // At this point, until it closes, the client shouldn't be sending anything else
+    // over TCP. This implies that, either way, we will close the task when this call
+    // returns. This match statement just picks the right logging/error messages...
+    let mut tmp_buf = [0; 4];
+    match stream.read(&mut tmp_buf).await {
+        Ok(0) => println!("Client at {addr} disconnected..."),
+        Ok(1..) => eprintln!("ERROR: Unexpected behavior from client at {addr}"),
+        Err(e) => {
+            eprintln!("ERROR: Encountered error {e} while waiting for client at {addr} to close")
+        }
+    }
+
+    println!("Freeing {n_ports} channels...");
+
+    Ok(n_ports.get())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
 
@@ -96,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     .unwrap();
 
     // a ring buffer of ring buffers hahaaha
-    let (mut rb_tx, mut rb_rx) = rtrb::RingBuffer::new(128);
+    let (mut rx_sender, mut rx_receiver) = rtrb::RingBuffer::new(128);
 
     let (client, _status) = jack::Client::new("SERVER", jack::ClientOptions::NO_START_SERVER)?;
 
@@ -113,6 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut rxs = Vec::with_capacity(max_num_ports.get());
 
+    // Thread 1: JACK Client
     let reader_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
         let mut remaining_frames = scope.n_frames() as usize;
 
@@ -123,14 +191,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         while let Some(rem) = num::NonZeroUsize::new(remaining_frames) {
             rxs.retain(|ClientRx { rx, .. }| !rx.is_abandoned());
 
-            while let Ok(rx) = rb_rx.pop() {
+            while let Ok(rx) = rx_receiver.pop() {
                 rxs.push(rx);
             }
 
             let frames = CHUNK_SIZE_FRAMES.min(rem);
             remaining_frames -= frames.get();
 
-            for ClientRx { rx, n_ports: n_channels } in &mut rxs {
+            for ClientRx {
+                rx,
+                n_ports: n_channels,
+            } in &mut rxs
+            {
                 let Ok(read_chunk) = rx.read_chunk(n_channels.checked_mul(frames).unwrap().get())
                 else {
                     continue;
@@ -178,70 +250,108 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?
     }
 
-    let (mut event_tx, mut event_rx) = rtrb::RingBuffer::new(128);
+    let (tx_sender, mut tx_receiver) = rtrb::RingBuffer::new(128);
 
-    let tcp_thread = std::thread::spawn(move || {
-        let listener = std::net::TcpListener::bind("[::]:6910").expect("ERROR: Failed to create TCP listener");
+    // single-threaded runtime
+    let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("ERROR: failed to");
 
-        loop {
-            let (mut stream, address) = listener.accept().expect("ERROR: Failed to accept TCP connection");
+    // Thread 2: TCP Thread
+    std::thread::spawn(move || {
 
-            event_tx.push((address, stream)).expect("ERROR: Connection request ring buffer too contented");
-        }
+        rt.block_on(async move {
+
+            let mut num_available_ports = max_num_ports.get();
+            let listener = tokio::net::TcpListener::bind("[::]:6910")
+                .await
+                .expect("ERROR: Failed to create TCP listener");
+            let mut task_set = tokio::task::JoinSet::new();
+
+            // TODO: Do something about this
+            let tx_sender = Rc::new(RefCell::new(tx_sender));
+
+            loop {
+                let (stream, addr) = listener
+                    .accept()
+                    .await
+                    .expect("ERROR: Failed to accept TCP connection");
+
+                while let Some(join_result) = task_set.try_join_next() {
+                    match join_result {
+                        Ok(task_result) => match task_result {
+                            Ok(n_ports) => num_available_ports -= n_ports,
+                            Err(e) => eprintln!("TCP task for client at {addr} failed with error {e}"),
+                        },
+                        // We never cancel the tasks, so this necessarily means that
+                        // handle_tcp_connection panicked, which we consider a bug.
+                        Err(e) => unreachable!("TCP task with client at {addr} panicked with error: {e}"),
+                    }
+                }
+
+                task_set.spawn_local(handle_tcp_connection(
+                    stream,
+                    addr,
+                    num_available_ports,
+                    rb_size_frames,
+                    Rc::clone(&tx_sender),
+                ));
+            }
+        })
     });
 
-    let mut rbs = HashMap::with_capacity(max_num_ports.get());
-    let mut scratch_buffer = Box::from_iter(iter::repeat(0.).take(CHUNK_SIZE_FRAMES.checked_mul(max_num_ports).unwrap().get()));
-    let mut num_available_ports = max_num_ports.get();
     let socket = std::net::UdpSocket::bind(("0.0.0.0", PORT))?;
+
+    let mut client_table = HashMap::new();
+
+    const MAX_SPLS_PER_DATAGRAM: usize = 368;
+    const MAX_DATAGRAM_SIZE_BYTES: usize = MAX_SPLS_PER_DATAGRAM * size_of::<f32>();
+    let mut buf = [0 ; MAX_DATAGRAM_SIZE_BYTES + 1];
 
     loop {
 
-        while let Ok((addr, mut stream)) = event_rx.pop() {
+        while let Ok(event) = tx_receiver.pop() {
 
-            // read the requested port count
-            let requested_num_ports = usize::from_be_bytes(read_exact_array(&mut stream)?);
+            match event {
+                TCPEvent::NewClient { addr, rx, tx } => {
+                    client_table.insert(addr, tx).expect("ERROR: Clients with duplicate addreses found");
 
-            println!("Client at {addr} requested {requested_num_ports} ports...");
-
-            let n_ports = requested_num_ports.min(num_available_ports);
-            num_available_ports -= n_ports;
-
-            // Return how many we can actually serve
-            stream.write_all(&n_ports.to_be_bytes())?;
-
-            println!("Client at {addr} got {n_ports} ports");
-
-            // Also, return the buffering suggestion
-            stream.write_all(&CHUNK_SIZE_FRAMES.get().to_be_bytes())?;
-
-            let Some(n_ports) = num::NonZeroUsize::new(n_ports) else {
-                continue;
-            };
-
-            let rb_size_spls = rb_size_frames.checked_mul(n_ports).unwrap();
-            let chunk_size_spls = CHUNK_SIZE_FRAMES.checked_mul(n_ports).unwrap();
-
-            let (tx, rx) = rtrb::RingBuffer::new(rb_size_spls.get());
-
-            rbs.insert(addr, (n_ports, tx)).expect("ERROR: Clients with duplicate addresses found");
-
-            rb_tx.push(ClientRx { rx, n_ports }).expect("ERROR: event ring buffer too contended");
+                    rx_sender.push(rx).expect("ERROR: Audio thread ring buffer too contended");
+                },
+                TCPEvent::RemoveClient { addr } => todo!(),
+            }
+            
         }
 
-        let (size, source_addr) = socket.(as_bytes_mut(&mut scratch_buffer))?;
+        let (bytes_read, source_addr) = socket.recv_from(&mut buf)?;
 
-        assert!(size.is_multiple_of(size_of::<f32>()));
+        if let Some(ClientTx { tx, n_ports, scratch_buffer }) = client_table.get_mut(&source_addr) {
+            let chunk_size_spls = CHUNK_SIZE_FRAMES.checked_mul(*n_ports).unwrap();
+            
+            assert_eq!(
+                bytes_read % chunk_size_spls, 0,
+                "ERROR: Incomplete datagram from {source_addr}"
+            );
+
+            if bytes_read == 0 {
+                eprintln!("WARNING: Zero-sized datagram from {source_addr}");
+                continue;
+            }
+
+            let n_frames = bytes_read / bytes_read;
 
 
+
+            assert!(
+                bytes_read <= MAX_DATAGRAM_SIZE_BYTES,
+                "ERROR: Oversized datagram from {source_addr}"
+            );
+
+            scratch_buffer.drain(..);
+
+        } else {
+            eprintln!("WARNING: received datagram from unknown address {source_addr}");
+        }
     }
 }
-
-// #[tokio::main]
-// async fn main() -> Result<(), Box<dyn Error>> {
-
-//     let (num_ports, addr) = accept_syfala_client_connection(max_num_ports.get())?;
-
-//     let mut ring_bufs = Vec::with_capacity(num_ports.get());
-
-// }
