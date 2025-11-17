@@ -1,4 +1,4 @@
-use core::{cmp, error::Error, iter, num, ptr};
+use core::{cmp, error::Error, iter, mem, num, ptr};
 use std::{collections::HashMap, io};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -18,7 +18,7 @@ fn as_bytes_mut(data: &mut [f32]) -> &mut [u8] {
 }
 
 const PORT: u16 = 6910;
-const RB_SIZE_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 13).unwrap();
+const RB_SIZE_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 16).unwrap();
 
 // 1
 const CHUNK_SIZE_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 4).unwrap();
@@ -111,8 +111,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut rxs = Vec::with_capacity(max_num_ports.get());
 
+    let mut cycle_idx = 0u64;
+
     // Thread 1: JACK Client
     let reader_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
+        cycle_idx += 1;
+
         let Some(frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
             return jack::Control::Continue;
         };
@@ -131,25 +135,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         for (ClientRx { rx, n_ports }, n_discarded_frames) in &mut rxs {
             let bufs = &mut port_buf_ptrs[..n_ports.get()];
-            let discarded = *n_discarded_frames;
 
             let requested_frames = frames.checked_add(*n_discarded_frames).unwrap();
             let available_frames = rx.slots() / *n_ports;
 
             let read_frames = requested_frames.get().min(available_frames);
-            
-            let read_chunk = rx
-                .read_chunk(read_frames.checked_mul(n_ports.get()).unwrap())
-                .unwrap();
 
-            
-            let (start, end) = read_chunk.as_slices();
-            
+            let discarded = mem::replace(n_discarded_frames, requested_frames.get() - read_frames);
+
+            if requested_frames > frames {
+                println!("{cycle_idx}: {discarded} samples lost!");
+            }
+
             let mut ptrs_iter = bufs.iter_mut();
-            
-            for &sample in iter::chain(start, end).skip(discarded.checked_mul(n_ports.get()).unwrap()) {
+
+            for sample in rx
+                .read_chunk(read_frames.checked_mul(n_ports.get()).unwrap())
+                .unwrap()
+                .into_iter()
+                .skip(discarded.checked_mul(n_ports.get()).unwrap())
+            {
                 // deinterleave chunk contents
-                
+
                 // we cannot use Iterator::cycle or something like iter::repeat + flatten
                 // so we have to resort to doing whatever this is
                 let ptr = if let Some(ptr) = ptrs_iter.next() {
@@ -159,19 +166,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // bufs has non-zero length, so this, at least, always succeeds
                     ptrs_iter.next().unwrap()
                 };
-                
+
                 unsafe { ptr.write(sample) };
-                
+
                 // SAFETY: this happens at most `frames` times for this pointer,
                 // guaranteeing this stays within the buffer
                 unsafe { ptr.increment() };
             }
-            
-            read_chunk.commit_all();
-            *n_discarded_frames = requested_frames.get() - read_frames;
+
             port_buf_ptrs = &mut port_buf_ptrs[n_ports.get()..];
         }
-        
+
         jack::Control::Continue
     });
 
@@ -265,7 +270,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 println!("Allocating ring buffer: {rb_size_spls} samples");
 
-                let (tx, rx) = rtrb::RingBuffer::new(rb_size_spls.get());
+                let (mut tx, rx) = rtrb::RingBuffer::new(rb_size_spls.get());
+
+                for _ in 0..n_ports.get() * 32 {
+                    tx.push(0.0).unwrap();
+                }
 
                 tx_sender
                     .push(TCPEvent::NewClient {
@@ -308,19 +317,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         // size of the original datagram. Combined with MSG_PEEK (Or UdpSocket::peek_from),
         // we can find out the source and the size of the packet before copying it anywhere
         // TODO: Can we save an extra copy by using libc directly?
+        // Is it actually worth saving on that extra copy?
 
         let (bytes_read, source_addr) = socket.recv_from(as_bytes_mut(&mut buf))?;
 
         while let Ok(event) = tx_receiver.pop() {
             match event {
                 TCPEvent::NewClient { addr, rx, tx } => {
-                    if client_table.insert(addr, (tx, 0u32)).is_some() {
-                        println!("ERROR: Clients with duplicate addresses found");
+                    if client_table.insert(addr, (tx, 0u64, Some(rx))).is_some() {
+                        unreachable!("ERROR: Clients with duplicate addresses found");
                     }
-
-                    rx_sender
-                        .push(rx)
-                        .expect("ERROR: Audio thread client queue too contended");
                 }
                 TCPEvent::RemoveClient { addr } => {
                     client_table
@@ -330,10 +336,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // right now we do three copies: one into buf, one from buf into the scratch buffers,
-        // then, from the scratch buffer into the ring buffer. We can reduce this to only one
+        if let Some((tx, sample_index, rx)) = client_table.get_mut(&source_addr) {
 
-        if let Some((tx, packet_idx)) = client_table.get_mut(&source_addr) {
+            // irrecoverable errors as per our protocol
+
             if bytes_read % FLOAT_SIZE != 0 {
                 eprintln!("WARNING: misaligned datagram ({bytes_read}B) from {source_addr}");
                 continue;
@@ -344,26 +350,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             };
 
-            let Some(num_samples) = num::NonZeroUsize::new(num_words.get() - 1) else {
+            let Some(num_samples) = num_words.get().checked_sub(2).and_then(num::NonZeroUsize::new) else {
                 eprintln!("WARNING: datagram from {source_addr} contains no samples");
                 continue;
             };
+
+            // this one isn't much of an issue
 
             if num_samples > MAX_SPLS_PER_DATAGRAM {
                 eprintln!("WARNING: Oversized ({bytes_read}B) datagram from {source_addr}");
             }
 
-            let (index, samples) = buf.split_at(1);
-            let index = index[0].to_bits();
+            let (index, samples) = buf.split_at(2);
+            let index = (index[0].to_bits() as u64) | ((index[1].to_bits() as u64) << 32);
 
-            match index.cmp(&packet_idx) {
-                cmp::Ordering::Less => eprintln!("WARNING: Packet from {source_addr} reordered"),
+            println!("{index}");
+
+            match index.cmp(&sample_index) {
+                cmp::Ordering::Less => eprintln!("WARNING: Samples from {source_addr} reordered"),
                 cmp::Ordering::Equal => (),
-                cmp::Ordering::Greater => eprintln!("WARNING: Packet from {source_addr} lost"),
+                cmp::Ordering::Greater => eprintln!("WARNING: Samples from {source_addr} lost"),
             }
 
-            *packet_idx = index.wrapping_add(1);
             let samples_buf = &samples[..num_samples.get()];
+
+            *sample_index = sample_index.wrapping_add(samples_buf.len() as u64);
 
             let rb_slots = tx.slots();
 
@@ -374,6 +385,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             tx.write_chunk_uninit(available_slots)
                 .unwrap()
                 .fill_from_iter(sent_immediately.iter().copied());
+
+            if let Some(rx) = rx.take_if(|_| rx_sender.slots() >= 1) {
+                rx_sender.push(rx).unwrap();
+                eprintln!("Started listening for data from {source_addr}");
+            }
 
             if lost.len() > 0 {
                 eprintln!(
