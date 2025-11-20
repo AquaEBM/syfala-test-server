@@ -3,13 +3,24 @@ use std::{collections::HashMap, io};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-fn as_bytes_mut(data: &mut [Sample]) -> &mut [u8] {
-    // SAFETY: all bit patterns for Sample (and u8) are valid, references have same lifetime
+const fn as_bytes_mut(data: &mut [Sample]) -> &mut [u8] {
+    // SAFETY: all bit patterns for Sample u8 are valid, references have same lifetime
     unsafe {
         core::slice::from_raw_parts_mut(
             data.as_mut_ptr().cast(),
             // shouldn't panic, but wrapping around would be incorrect
             SAMPLE_SIZE.get().checked_mul(data.len()).unwrap(),
+        )
+    }
+}
+
+const fn as_bytes(data: &[Sample]) -> &[u8] {
+    // SAFETY: all bit patterns for u8 are valid, references have same lifetime
+    unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().cast(),
+            // shouldn't panic, but wrapping around would be incorrect
+            SAMPLE_SIZE.get().checked_mul(data.len()).unwrap()
         )
     }
 }
@@ -25,14 +36,22 @@ const SILENCE: Sample = 0.;
 
 const SAMPLE_SIZE: num::NonZeroUsize = nz(size_of::<Sample>());
 
-const RB_SIZE_FRAMES: num::NonZeroUsize = nz(1 << 16);
+const SAMPLE_RATE: f64 = 48000.;
 
-// 1
+const RB_SIZE_SECONDS: f64 = 4.;
+
+const RB_SIZE_FRAMES: num::NonZeroUsize = nz((SAMPLE_RATE * RB_SIZE_SECONDS) as usize);
+
+const MAX_DATAGRAM_SIZE: num::NonZeroUsize = nz(1452);
+
+const MAX_SAMPLE_DATA_SIZE_PER_DATAGRAM: num::NonZeroUsize =
+    nz(MAX_DATAGRAM_SIZE.get().strict_sub(size_of::<u64>()));
+const MAX_SPLS_PER_DATAGRAM: num::NonZeroUsize =
+    nz(MAX_SAMPLE_DATA_SIZE_PER_DATAGRAM.get() / SAMPLE_SIZE.get());
+
+const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN; // AKA 1
+
 const CHUNK_SIZE_FRAMES: num::NonZeroUsize = nz(1 << 4);
-const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN;
-
-const MAX_SPLS_PER_DATAGRAM: num::NonZeroUsize = nz(368);
-
 const EVENT_QUEUE_SIZE: num::NonZeroUsize = nz(128);
 
 async fn read_exact_array<const N: usize>(
@@ -106,7 +125,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // a ring buffer of ring buffers hahaaha
-    let (mut rx_sender, mut rx_receiver) = rtrb::RingBuffer::<(rtrb::Consumer<Sample>, num::NonZeroUsize)>::new(EVENT_QUEUE_SIZE.get());
+    let (mut rx_sender, mut rx_receiver) = rtrb::RingBuffer::<(
+        rtrb::Consumer<Sample>,
+        num::NonZeroUsize,
+    )>::new(EVENT_QUEUE_SIZE.get());
 
     let (client, _status) = jack::Client::new("SERVER", jack::ClientOptions::NO_START_SERVER)?;
 
@@ -121,11 +143,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut rxs = Vec::with_capacity(max_num_ports.get());
 
-    let mut cycle_idx = 0u64;
-
     // Thread 1: JACK Client
     let reader_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
-        cycle_idx += 1;
 
         let Some(frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
             return jack::Control::Continue;
@@ -153,9 +172,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let discarded = mem::replace(n_discarded_frames, requested_frames.get() - read_frames);
 
-            if requested_frames > frames {
-                println!("{cycle_idx}: {discarded} samples lost!");
-            }
+            // if requested_frames > frames {
+            //     println!("{cycle_idx}: {discarded} samples lost!");
+            // }
 
             let mut ptrs_iter = bufs.iter_mut();
 
@@ -365,55 +384,48 @@ fn main() -> Result<(), Box<dyn Error>> {
             rx_cell,
         }) = client_table.get_mut(&source_addr)
         {
-            // irrecoverable errors as per our protocol
+            // the only irrecoverable error (actually invalid packet) as per our protocol
 
-            if bytes_read % SAMPLE_SIZE != 0 {
-                eprintln!("WARNING: misaligned datagram ({bytes_read}B) from {source_addr}");
-                continue;
-            }
-
-            let Some(num_words) = num::NonZeroUsize::new(bytes_read / SAMPLE_SIZE) else {
+            let Some(num_sample_bytes) = bytes_read.checked_sub(size_of::<u64>()) else {
                 eprintln!("WARNING: datagram from {source_addr} missing index field");
                 continue;
             };
 
-            let Some(num_samples) = num_words
-                .get()
-                .checked_sub(2)
-                .and_then(num::NonZeroUsize::new)
-            else {
-                eprintln!("WARNING: datagram from {source_addr} contains no samples");
-                continue;
-            };
-
             // this one isn't much of an issue
-
-            if num_samples > MAX_SPLS_PER_DATAGRAM {
+            if bytes_read > MAX_DATAGRAM_SIZE.get() {
                 eprintln!("WARNING: Oversized ({bytes_read}B) datagram from {source_addr}");
             }
+            
+            let num_samples = num_sample_bytes / SAMPLE_SIZE;
+            if let Some(_trailing_bytes) = num::NonZeroUsize::new(num_sample_bytes % SAMPLE_SIZE) {
+                eprintln!("WARNING: misaligned datagram ({bytes_read}B) from {source_addr}");
+            }
 
-            let (index, samples) = buf.split_at(2);
-            let index = (index[0].to_bits() as u64) | ((index[1].to_bits() as u64) << 32);
+            let index = u64::from_be_bytes(as_bytes(&buf)[..size_of::<u64>()].try_into().unwrap());
+
+            // println!("{index}");
 
             match index.cmp(&sample_index) {
-                cmp::Ordering::Less => eprintln!("WARNING: Samples from {source_addr} reordered"),
+                cmp::Ordering::Less => {
+                    eprintln!("WARNING: Samples from {source_addr} reordered");
+                    continue;
+                },
                 cmp::Ordering::Equal => (),
                 cmp::Ordering::Greater => eprintln!("WARNING: Samples from {source_addr} lost"),
             }
 
-            let samples_buf = &samples[..num_samples.get()];
+            *sample_index = sample_index.wrapping_add(num_samples as u64);
+            let samples = &buf[2..][..num_samples];
 
-            *sample_index = sample_index.wrapping_add(samples_buf.len() as u64);
+            let available_slots = tx.slots().min(num_samples);
 
-            let rb_slots = tx.slots();
-
-            let available_slots = rb_slots.min(num_samples.get());
-
-            let (sent_immediately, lost) = samples_buf.split_at(available_slots);
+            let (sent_immediately, lost) = samples.split_at(available_slots);
 
             tx.write_chunk_uninit(available_slots)
                 .unwrap()
                 .fill_from_iter(sent_immediately.iter().copied());
+
+            *sample_index = sample_index.wrapping_add(sent_immediately.len() as u64);
 
             if let Some(rx) = rx_cell.take_if(|_| rx_sender.slots() >= 1) {
                 rx_sender.push((rx, *n_ports)).unwrap();
