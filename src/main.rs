@@ -1,4 +1,4 @@
-use core::{cmp, error::Error, iter, mem, num, ptr};
+use core::{error::Error, iter, mem, num, ptr};
 use std::{collections::HashMap, io};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -141,7 +141,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut port_buf_ptrs =
         Box::from_iter(iter::repeat_with(JackBufPtrMut::dangling).take(max_num_ports.get()));
 
-    let mut rxs = Vec::with_capacity(max_num_ports.get());
+    // Man, you were so close, type inference. So. Freaking. Close.
+    let mut rxs = Vec::<((rtrb::Consumer<Sample>, _), _)>::with_capacity(max_num_ports.get());
 
     // Thread 1: JACK Client
     let reader_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
@@ -154,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             *ptr = JackBufPtrMut::from_slice(port.as_mut_slice(scope))
         }
 
-        // rxs.retain(|(rx, _)| !rx.is_abandoned());
+        rxs.retain(|((rx, _), _)| !rx.is_abandoned());
 
         while let Ok(rx) = rx_receiver.pop() {
             rxs.push((rx, 0usize));
@@ -171,10 +172,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             let read_frames = requested_frames.get().min(available_frames);
 
             let discarded = mem::replace(n_discarded_frames, requested_frames.get() - read_frames);
-
-            // if requested_frames > frames {
-            //     println!("{cycle_idx}: {discarded} samples lost!");
-            // }
 
             let mut ptrs_iter = bufs.iter_mut();
 
@@ -216,8 +213,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for i in 1..=max_num_ports.get() {
         let string = format!("SERVER:output{i}");
 
-        client.connect_ports_by_name(&string, "system:playback_3")?;
-        client.connect_ports_by_name(&string, "system:playback_4")?;
+        client.connect_ports_by_name(&string, "system:playback_1")?;
+        client.connect_ports_by_name(&string, "system:playback_2")?;
     }
 
     let (mut tx_sender, mut tx_receiver) = rtrb::RingBuffer::new(EVENT_QUEUE_SIZE.get());
@@ -368,12 +365,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     {
                         unreachable!("ERROR: Clients with duplicate addresses found");
                     }
-                }
+                },
                 TCPEvent::RemoveClient { addr } => {
                     client_table
                         .remove(&addr)
                         .expect("ERROR: Attempt to remove non-existent client");
-                }
+                },
             }
         }
 
@@ -384,18 +381,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             rx_cell,
         }) = client_table.get_mut(&source_addr)
         {
-            // the only irrecoverable error (actually invalid packet) as per our protocol
+            // The only irrecoverable error (actually invalid packet) as per our protocol
 
             let Some(num_sample_bytes) = bytes_read.checked_sub(size_of::<u64>()) else {
                 eprintln!("WARNING: datagram from {source_addr} missing index field");
                 continue;
             };
 
-            // this one isn't much of an issue
+            // This one isn't much of an issue
             if bytes_read > MAX_DATAGRAM_SIZE.get() {
                 eprintln!("WARNING: Oversized ({bytes_read}B) datagram from {source_addr}");
             }
-            
+
             let num_samples = num_sample_bytes / SAMPLE_SIZE;
             if let Some(_trailing_bytes) = num::NonZeroUsize::new(num_sample_bytes % SAMPLE_SIZE) {
                 eprintln!("WARNING: misaligned datagram ({bytes_read}B) from {source_addr}");
@@ -403,40 +400,67 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let index = u64::from_be_bytes(as_bytes(&buf)[..size_of::<u64>()].try_into().unwrap());
 
-            // println!("{index}");
+            // We discard samples from reordered packets, we've already zero-filled their spots
+            let Some(samples_missed) = index.checked_sub(*sample_index) else {
+                eprintln!("WARNING: Samples from {source_addr} reordered");
+                continue;
+            };
 
-            match index.cmp(&sample_index) {
-                cmp::Ordering::Less => {
-                    eprintln!("WARNING: Samples from {source_addr} reordered");
-                    continue;
-                },
-                cmp::Ordering::Equal => (),
-                cmp::Ordering::Greater => eprintln!("WARNING: Samples from {source_addr} lost"),
-            }
+            let samples_missed = samples_missed as usize;
 
-            *sample_index = sample_index.wrapping_add(num_samples as u64);
-            let samples = &buf[2..][..num_samples];
+            let all_samples = &buf[2..][..num_samples];
 
-            let available_slots = tx.slots().min(num_samples);
+            // The first samples_missed samples will be filled with zeros
+            let n_requested_samples = num_samples.strict_add(samples_missed);
 
-            let (sent_immediately, lost) = samples.split_at(available_slots);
+            let n_available_sample_slots = tx.slots().min(n_requested_samples);
 
-            tx.write_chunk_uninit(available_slots)
-                .unwrap()
-                .fill_from_iter(sent_immediately.iter().copied());
+            let n_zero_filled_slots = samples_missed.min(n_available_sample_slots);
+            let n_written_slots = n_available_sample_slots.strict_sub(n_zero_filled_slots);
 
-            *sample_index = sample_index.wrapping_add(sent_immediately.len() as u64);
-
-            if let Some(rx) = rx_cell.take_if(|_| rx_sender.slots() >= 1) {
-                rx_sender.push((rx, *n_ports)).unwrap();
-                eprintln!("Started listening for data from {source_addr}");
-            }
+            // TODO: Is queueing the samples in lost somewhere else to resend them later worth it?
+            // For now we just discard them and send zeros. In any case, the ring buffer being too
+            // small is something worth alerting the developer.
+            let (written, lost) = all_samples.split_at(n_written_slots);
 
             if lost.len() > 0 {
                 eprintln!(
                     "WARNING: Ring buffer for {source_addr} full!: {} samples lost!",
                     lost.len()
                 );
+            }
+
+            let mut write_chunk = tx.write_chunk_uninit(n_available_sample_slots).unwrap();
+
+            let (start, end) = write_chunk.as_mut_slices();
+
+            // Split the ring buffer slices into two parts, the first one will be filled with
+            // zeros, we will write into the rest as much of this packet's data as we can
+
+            let start_zero_filled_len = start.len().min(n_zero_filled_slots);
+            let end_zero_filled_len = n_zero_filled_slots.strict_sub(start_zero_filled_len);
+
+            let (rb_zero_filled_start, rb_spls_start) = start.split_at_mut(start_zero_filled_len);
+            let (rb_zero_filled_end, rb_spls_end) = end.split_at_mut(end_zero_filled_len);
+
+            // NIGHTLY: #[feature(maybe_uninit_fill)], use write_filled
+            for s in iter::chain(rb_zero_filled_start, rb_zero_filled_end) {
+                s.write(SILENCE);
+            }
+
+            let (packet_spls_start, packet_spls_end) = written.split_at(rb_spls_start.len());
+
+            // NIGHTLY: #[feature(maybe_uninit_fill)], use write_copy_of_slice
+            for (&i, o) in iter::zip(packet_spls_start, rb_spls_start) { o.write(i); }
+            for (&i, o) in iter::zip(packet_spls_end, rb_spls_end) { o.write(i); }
+
+            unsafe { write_chunk.commit_all() }
+
+            *sample_index = sample_index.wrapping_add(n_available_sample_slots as u64);
+
+            if let Some(rx) = rx_cell.take_if(|_| rx_sender.slots() >= 1) {
+                rx_sender.push((rx, *n_ports)).unwrap();
+                eprintln!("Started listening for data from {source_addr}");
             }
         } else {
             eprintln!("WARNING: received datagram from unregistered address: {source_addr}");
