@@ -50,9 +50,11 @@ const MAX_SPLS_PER_DATAGRAM: num::NonZeroUsize =
     nz(MAX_SAMPLE_DATA_SIZE_PER_DATAGRAM.get() / SAMPLE_SIZE.get());
 
 const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN; // AKA 1
-
 const CHUNK_SIZE_FRAMES: num::NonZeroUsize = nz(1 << 4);
 const EVENT_QUEUE_SIZE: num::NonZeroUsize = nz(128);
+
+const JITTER_BUF_SIZE_SECONDS: f64 = 0.001;
+const JITTER_BUF_SIZE_FRAMES: usize = (SAMPLE_RATE * JITTER_BUF_SIZE_SECONDS) as usize;
 
 async fn read_exact_array<const N: usize>(
     reader: &mut (impl AsyncRead + Unpin + ?Sized),
@@ -77,9 +79,8 @@ enum TCPEvent {
 
 struct ClientTx {
     tx: rtrb::Producer<Sample>,
-    n_ports: num::NonZeroUsize,
     sample_index: u64,
-    rx_cell: Option<rtrb::Consumer<Sample>>,
+    rx_cell: Option<(rtrb::Consumer<Sample>, num::NonZeroUsize)>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,8 +214,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for i in 1..=max_num_ports.get() {
         let string = format!("SERVER:output{i}");
 
-        client.connect_ports_by_name(&string, "system:playback_1")?;
-        client.connect_ports_by_name(&string, "system:playback_2")?;
+        client.connect_ports_by_name(&string, "system:playback_3")?;
+        client.connect_ports_by_name(&string, "system:playback_4")?;
     }
 
     let (mut tx_sender, mut tx_receiver) = rtrb::RingBuffer::new(EVENT_QUEUE_SIZE.get());
@@ -291,12 +292,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let Some(n_ports) = num::NonZeroUsize::new(n_ports) else {
                     continue;
                 };
+                
+                let rb_size_frames = RB_SIZE_FRAMES.checked_add(JITTER_BUF_SIZE_FRAMES).unwrap();
 
-                let rb_size_spls = RB_SIZE_FRAMES.checked_mul(n_ports).unwrap();
+                let rb_size_spls = rb_size_frames.checked_mul(n_ports).unwrap();
 
                 println!("Allocating ring buffer: {rb_size_spls} samples");
 
-                let (tx, rx) = rtrb::RingBuffer::<Sample>::new(rb_size_spls.get());
+                let (mut tx, rx) = rtrb::RingBuffer::<Sample>::new(rb_size_spls.get());
+
+                let jitter_buf_size_spls = n_ports.get().strict_mul(JITTER_BUF_SIZE_FRAMES);
+                for _ in 0..jitter_buf_size_spls {
+                    tx.push(SILENCE).expect("jitter delay smaller than the actual ring buffer size, lol");
+                }
 
                 tx_sender
                     .push(TCPEvent::NewClient {
@@ -356,9 +364,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             addr,
                             ClientTx {
                                 tx,
-                                n_ports,
                                 sample_index: 0u64,
-                                rx_cell: Some(rx),
+                                rx_cell: Some((rx, n_ports)),
                             },
                         )
                         .is_some()
@@ -376,7 +383,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if let Some(ClientTx {
             tx,
-            n_ports,
             sample_index,
             rx_cell,
         }) = client_table.get_mut(&source_addr)
@@ -458,8 +464,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             *sample_index = sample_index.wrapping_add(n_available_sample_slots as u64);
 
-            if let Some(rx) = rx_cell.take_if(|_| rx_sender.slots() >= 1) {
-                rx_sender.push((rx, *n_ports)).unwrap();
+            if let Some((rx, n_ports)) = rx_cell.take_if(|_| rx_sender.slots() >= 1) {
+                rx_sender.push((rx, n_ports)).unwrap();
                 eprintln!("Started listening for data from {source_addr}");
             }
         } else {
