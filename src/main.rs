@@ -1,4 +1,4 @@
-use core::{error::Error, iter, mem, num, ptr};
+use core::{cell::OnceCell, error::Error, iter, num, ptr};
 use std::{collections::HashMap, io};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -53,7 +53,7 @@ const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN; // AKA 1
 const CHUNK_SIZE_FRAMES: num::NonZeroUsize = nz(1 << 4);
 const EVENT_QUEUE_SIZE: num::NonZeroUsize = nz(128);
 
-const JITTER_BUF_SIZE_SECONDS: f64 = 0.001;
+const JITTER_BUF_SIZE_SECONDS: f64 = 0.005;
 const JITTER_BUF_SIZE_FRAMES: usize = (SAMPLE_RATE * JITTER_BUF_SIZE_SECONDS) as usize;
 
 async fn read_exact_array<const N: usize>(
@@ -159,28 +159,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         rxs.retain(|((rx, _), _)| !rx.is_abandoned());
 
         while let Ok(rx) = rx_receiver.pop() {
-            rxs.push((rx, 0usize));
+            rxs.push((rx, OnceCell::new()));
         }
 
         let mut port_buf_ptrs = port_buf_ptrs.as_mut();
 
-        for ((rx, n_ports), n_discarded_frames) in &mut rxs {
+        let last_frame_time = scope.last_frame_time();
+
+        for ((rx, n_ports), frame_counter) in &mut rxs {
             let bufs = &mut port_buf_ptrs[..n_ports.get()];
 
-            let requested_frames = frames.checked_add(*n_discarded_frames).unwrap();
-            let available_frames = rx.slots() / *n_ports;
+            let _ = frame_counter.get_or_init(|| last_frame_time);
+            let frame_counter = frame_counter.get_mut().unwrap();
 
-            let read_frames = requested_frames.get().min(available_frames);
+            // Dubious behavior in some cases where if last_frame_time is less than frame counter
+            // Does that ever happen?
+            let n_missed_frames = last_frame_time.wrapping_sub(*frame_counter) as usize;
 
-            let discarded = mem::replace(n_discarded_frames, requested_frames.get() - read_frames);
+            let n_requested_frames = frames.checked_add(n_missed_frames).unwrap();
+            let n_available_frames = rx.slots() / *n_ports;
+
+            let n_read_frames = n_requested_frames.get().min(n_available_frames);
 
             let mut ptrs_iter = bufs.iter_mut();
 
+            // We need a Deinterleaver struct like on the client side
             for sample in rx
-                .read_chunk(read_frames.checked_mul(n_ports.get()).unwrap())
+                .read_chunk(n_read_frames.checked_mul(n_ports.get()).unwrap())
                 .unwrap()
                 .into_iter()
-                .skip(discarded.checked_mul(n_ports.get()).unwrap())
+                // JACK zero-fills outputs so just skip them
+                .skip(n_missed_frames.checked_mul(n_ports.get()).unwrap())
             {
                 // deinterleave chunk contents
 
@@ -200,6 +209,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // guaranteeing this stays within the buffer
                 unsafe { ptr.increment() };
             }
+
+            *frame_counter = frame_counter.wrapping_add(n_read_frames as u32);
 
             port_buf_ptrs = &mut port_buf_ptrs[n_ports.get()..];
         }
